@@ -177,6 +177,26 @@ class ForkTests(unittest.TestCase):
             self.assertLess(edit, delete)
             self.assertIn("mihomo-test.gz", (root / "bin/checksums.txt").read_text())
 
+    def test_first_release_creates_tag_with_deploy_key_before_api(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "bin").mkdir()
+            plan = spec()
+            plan["binaries"] = ["mihomo-test.gz"]
+            (root / "bin/mihomo-test.gz").write_bytes(b"test binary")
+            (root / "bin/version.txt").write_text(plan["version"])
+            events = []
+            def api(path, method="GET", data=None):
+                events.append(method)
+                return {"id": 123, "assets": []}
+            with patch.object(fork, "ROOT", root), patch.object(fork, "manifest", return_value=plan), \
+                 patch.object(fork, "git", return_value="c" * 40), patch.dict(os.environ, GITHUB_SHA="c" * 40), \
+                 patch.object(fork, "releases", return_value=[]), patch.object(fork, "api", side_effect=api), \
+                 patch.object(fork, "run"), \
+                 patch.object(fork, "push_ref", side_effect=lambda *args: events.append("git push")):
+                fork.publish()
+            self.assertLess(events.index("git push"), events.index("POST"))
+
 
 if __name__ == "__main__":
     unittest.main()

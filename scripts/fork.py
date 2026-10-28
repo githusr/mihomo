@@ -373,6 +373,8 @@ def publish():
                 checksums.write(f"{hashlib.file_digest(stream, 'sha256').hexdigest()}  {artifact.name}\n")
     body = release_body(spec, commit)
     if release is None:
+        # The deploy key can create tags containing workflow changes; GITHUB_TOKEN cannot always do so.
+        push_ref(commit, f"refs/tags/{tag}")
         release = api(f"repos/{repo}/releases", "POST", {
             "tag_name": tag, "target_commitish": commit, "name": spec["title"], "body": body,
             "draft": True, "prerelease": spec["prerelease"], "make_latest": "false"})

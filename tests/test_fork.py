@@ -79,6 +79,30 @@ class ForkTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             fork.build_workflow(WORKFLOW.replace("go build", "echo ${{ secrets.SOME_SECRET }}"), spec())
 
+    def test_android_helper_precedes_core_without_changing_upstream_steps(self):
+        upstream = yaml.safe_load(WORKFLOW)
+        job = upstream["jobs"]["build"]
+        job["strategy"]["matrix"]["jobs"].append({"goos": "android", "output": "arm64-v8"})
+        # New upstream steps between toolchain setup and the build need no patch rebase.
+        job["steps"].insert(3, {"name": "Verify toolchain", "run": "go version"})
+        original_core = next(s for s in job["steps"] if s.get("name") == "Build core")
+        result = yaml.safe_load(fork.build_workflow(yaml.safe_dump(upstream), spec()))["jobs"]["build"]
+        self.assertEqual(result["strategy"]["matrix"], job["strategy"]["matrix"])
+        steps = result["steps"]
+        core = steps.index(original_core)
+        self.assertEqual(steps[core - 1], {
+            "name": "Build Android system DNS helper",
+            "if": "${{ matrix.jobs.goos == 'android' }}",
+            "run": 'sdkmanager "platforms;android-36" "build-tools;36.0.0"\n'
+                   'python3 component/systemdns/test_observer.py\n'
+                   'python3 component/systemdns/build.py\n',
+        })
+        self.assertEqual(steps[core - 2], {"name": "Verify toolchain", "run": "go version"})
+        for broken in ([], [original_core, original_core]):
+            job["steps"] = [s for s in job["steps"] if s.get("name") != "Build core"] + broken
+            with self.assertRaisesRegex(ValueError, "Build core"):
+                fork.build_workflow(yaml.safe_dump(upstream), spec())
+
     def test_failed_or_incomplete_release_is_not_up_to_date(self):
         plan = spec()
         release = dict(draft=False, body=f"{fork.MARKER}{plan['fingerprint']} -->",

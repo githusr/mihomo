@@ -1,0 +1,1521 @@
+From 2455d1f0440aeeb3f1fb742c68db0ee6a0a7d246 Mon Sep 17 00:00:00 2001
+From: githusr <143207276+githusr@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 06:12:14 +0000
+Subject: [PATCH] feat: follow Android network DNS in the standalone root core
+
+Adapt the ConnectivityManager observer, bounded socketpair protocol and retained dex cache from Asterisk4Magisk/AndroidLibClashLite#2. Publish system DNS snapshots without waiting for configuration reloads, coalesce cache refreshes under the existing lock, and start the failure deadline independently of the main loop. Keep the upstream changes limited to main and system DNS hooks; the fork workflow adapter builds the embedded dex. Include IPC, cache, resolver and reload regressions.
+---
+ component/systemdns/.gitignore                |   2 +
+ component/systemdns/README.md                 |  66 +++++
+ component/systemdns/build.py                  |  39 +++
+ component/systemdns/client.go                 | 101 ++++++++
+ component/systemdns/client_test.go            | 130 ++++++++++
+ component/systemdns/helper.go                 | 104 ++++++++
+ component/systemdns/helper_test.go            |  96 ++++++++
+ component/systemdns/java/SystemDnsHelper.java | 230 ++++++++++++++++++
+ component/systemdns/protocol.go               |  46 ++++
+ component/systemdns/protocol_test.go          |  37 +++
+ component/systemdns/start_android.go          |  28 +++
+ component/systemdns/start_other.go            |   7 +
+ component/systemdns/test_observer.py          | 183 ++++++++++++++
+ dns/system_common.go                          |  11 +-
+ dns/system_snapshot.go                        |  26 ++
+ dns/system_snapshot_test.go                   |  78 ++++++
+ hub/executor/system_dns.go                    |  24 ++
+ hub/executor/system_dns_test.go               |  92 +++++++
+ main.go                                       |  26 ++
+ 19 files changed, 1325 insertions(+), 1 deletion(-)
+ create mode 100644 component/systemdns/.gitignore
+ create mode 100644 component/systemdns/README.md
+ create mode 100644 component/systemdns/build.py
+ create mode 100644 component/systemdns/client.go
+ create mode 100644 component/systemdns/client_test.go
+ create mode 100644 component/systemdns/helper.go
+ create mode 100644 component/systemdns/helper_test.go
+ create mode 100644 component/systemdns/java/SystemDnsHelper.java
+ create mode 100644 component/systemdns/protocol.go
+ create mode 100644 component/systemdns/protocol_test.go
+ create mode 100644 component/systemdns/start_android.go
+ create mode 100644 component/systemdns/start_other.go
+ create mode 100644 component/systemdns/test_observer.py
+ create mode 100644 dns/system_snapshot.go
+ create mode 100644 dns/system_snapshot_test.go
+ create mode 100644 hub/executor/system_dns.go
+ create mode 100644 hub/executor/system_dns_test.go
+
+diff --git a/component/systemdns/.gitignore b/component/systemdns/.gitignore
+new file mode 100644
+index 0000000000000000000000000000000000000000..9dc8ad2f332162fa35606b0c110b51c8349dbe3c
+--- /dev/null
++++ b/component/systemdns/.gitignore
+@@ -0,0 +1,2 @@
++/helper.dex
++/__pycache__/
+diff --git a/component/systemdns/README.md b/component/systemdns/README.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..3973c7fe11c629cd2ba0636e9e31a91a0032bdef
+--- /dev/null
++++ b/component/systemdns/README.md
+@@ -0,0 +1,66 @@
++# Android root system DNS
++
++The standalone Android core starts a root `app_process` observer before loading
++configuration. It supplies physical-network DNS addresses for `system` in
++`nameserver`, `direct-nameserver`, `proxy-server-nameserver` and `nameserver-policy`.
++DNS queries still run through Mihomo. No APK, companion app or configuration flag
++is required. Non-root processes, other platforms, CMFA/JNI builds and tool
++commands (`-v`, `-h`, `-t`, `generate`, `age`, `convert-ruleset`) keep their existing
++behavior and do not extract or start the observer.
++
++The observer requires Android 8/API 26 or later and permission to access
++ConnectivityManager from the root SELinux domain. It ignores VPN networks,
++prefers the active physical network, otherwise uses validated physical networks
++or other eligible networks. IPv6 scope IDs are preserved. A change of DNS addresses
++or selected physical networks invalidates Mihomo's DNS caches and resolver
++connections, including handovers with identical DNS addresses. Empty snapshots
++withdraw old DNS. Callbacks invalidate the current network scan, as in the source
++PR; the observer does not retain startup networks that have disappeared.
++The existing public-DNS fallback in the built-in system resolver is unchanged.
++This discovers DNS server addresses; it does not delegate queries to Android's
++Private DNS service. Existing root redirect rules must exempt the core's own DNS
++traffic, just as with explicitly configured upstream DNS.
++
++`<core-home>/system-dns-helper.dex` is verified against the embedded bytes and
++reused or atomically replaced with mode 0400, without following symlinks. It is
++retained along with ART's cache after exit. Existing home permissions are kept;
++use a home directory trusted by root. The helper exchanges bounded, validated
++JSON snapshots over an inherited anonymous socketpair. Parent EOF and PDEATHSIG
++end the helper; normal shutdown waits up to two seconds before killing it.
++Startup failure or an unexpected channel/service failure exits the core with
++status 70, allowing its supervisor to restart it. A channel failure clears the
++DNS snapshot before requesting shutdown.
++Snapshot publication and failure notification never wait for configuration
++reloads. Cache/connection refreshes are coalesced behind the configuration lock.
++The ten-second forced-exit deadline starts on the reader goroutine, so startup
++or SIGHUP provider downloads cannot postpone it.
++
++## Building and checking
++
++Install JDK 17+, Android SDK platform 36 and Build Tools 36.0.0, set
++`ANDROID_HOME` (and `JAVA_HOME` if needed), then run:
++
++```sh
++python3 component/systemdns/test_observer.py
++python3 component/systemdns/build.py
++# Use the normal Android Go/NDK build after generating helper.dex.
++go test -race ./component/systemdns ./dns ./hub/executor
++```
++
++The fork's workflow adapter inserts dex generation before the Android core build;
++the feature patch leaves upstream workflows unchanged. Android builds first run
++the actual Java observer against fake platform services to check same-DNS handovers,
++duplicate callbacks, DNS changes, stale startup networks and VPN/offline selection.
++The dex is not checked in. Go tests exercise real socketpair/process shutdown,
++repeated-address handovers, malformed snapshots,
++atomic dex caching, concurrent DNS updates and DNS queries through the main,
++direct and policy resolvers. Host tests do not validate Android framework behavior.
++On a rooted device, check system DNS queries, Wi-Fi/mobile switching, offline
++withdrawal, handovers between networks with the same DNS addresses, helper death
++(exit 70), core death (helper cleanup), and that tool
++commands leave no helper/dex. Android/OEM SELinux policy and real IPv6 DNS require
++device testing.
++
++Adapted from [AndroidLibClashLite PR #2](https://github.com/Asterisk4Magisk/AndroidLibClashLite/pull/2)
++by 5ec1cff and the AsteriskMETA contributors. The protocol and dex cache reuse
++their LGPL-3.0 implementation; the Java observer retains its GPL-3.0 notice.
+diff --git a/component/systemdns/build.py b/component/systemdns/build.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..acb2626191dac8ac10e2ec73c380de9dbd986d1c
+--- /dev/null
++++ b/component/systemdns/build.py
+@@ -0,0 +1,39 @@
++#!/usr/bin/env python3
++"""Build the embedded Android network observer with JDK 17+ and Android SDK 36."""
++
++import os
++from pathlib import Path
++import shutil
++import subprocess
++import tempfile
++
++
++def main():
++    root = Path(__file__).resolve().parent
++    sdk = Path(os.environ["ANDROID_HOME"])
++    android_jar = sdk / "platforms/android-36/android.jar"
++    d8 = sdk / "build-tools/36.0.0/lib/d8.jar"
++    for path in (android_jar, d8):
++        if not path.is_file():
++            raise FileNotFoundError(f"Missing Android SDK component: {path}")
++
++    def java_tool(name):
++        suffix = ".exe" if os.name == "nt" else ""
++        return str(Path(os.environ["JAVA_HOME"]) / "bin" / (name + suffix)) if os.environ.get("JAVA_HOME") else name + suffix
++
++    with tempfile.TemporaryDirectory(prefix="mihomo-system-dns-") as tmp:
++        classes, dex = Path(tmp) / "classes", Path(tmp) / "dex"
++        classes.mkdir()
++        dex.mkdir()
++        subprocess.run([java_tool("javac"), "--release", "8", "-classpath", str(android_jar),
++                        "-d", str(classes), str(root / "java/SystemDnsHelper.java")], check=True)
++        subprocess.run([java_tool("java"), "-cp", str(d8), "com.android.tools.r8.D8", "--release",
++                        "--min-api", "26", "--lib", str(android_jar), "--output", str(dex),
++                        *map(str, sorted(classes.rglob("*.class")))], check=True)
++        if sorted(p.name for p in dex.iterdir()) != ["classes.dex"]:
++            raise RuntimeError("System DNS helper must fit in one dex")
++        shutil.copyfile(dex / "classes.dex", root / "helper.dex")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/component/systemdns/client.go b/component/systemdns/client.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..17de933b47fae53a79530b7402c20c80ad347b72
+--- /dev/null
++++ b/component/systemdns/client.go
+@@ -0,0 +1,101 @@
++//go:build linux
++
++package systemdns
++
++import (
++	"bufio"
++	"fmt"
++	"net"
++	"os"
++	"os/exec"
++	"runtime"
++	"sync"
++	"syscall"
++	"time"
++
++	"golang.org/x/sys/unix"
++)
++
++func start(cmd *exec.Cmd, update func([]string), failed func(error)) (func(), error) {
++	pair, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
++	if err != nil {
++		return nil, fmt.Errorf("system DNS socketpair: %w", err)
++	}
++	parent := os.NewFile(uintptr(pair[0]), "system-dns-parent")
++	child := os.NewFile(uintptr(pair[1]), "system-dns-child")
++	defer child.Close()
++	connection, err := net.FileConn(parent)
++	_ = parent.Close()
++	if err != nil {
++		return nil, err
++	}
++	// stdin watches the parent's lifetime; fd 3 carries snapshots back to it.
++	cmd.Stdin = child
++	cmd.ExtraFiles = []*os.File{child}
++	cmd.Stderr = os.Stderr
++	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true, Pdeathsig: syscall.SIGKILL}
++	started, done := make(chan error, 1), make(chan error, 1)
++	go func() {
++		// PDEATHSIG follows the creating OS thread, which Go may otherwise retire.
++		runtime.LockOSThread()
++		defer runtime.UnlockOSThread()
++		err := cmd.Start()
++		started <- err
++		if err == nil {
++			done <- cmd.Wait()
++		}
++	}()
++	if err = <-started; err != nil {
++		_ = connection.Close()
++		return nil, fmt.Errorf("start system DNS helper: %w", err)
++	}
++	_ = child.Close()
++	stopping := make(chan struct{})
++	var once sync.Once
++	stop := func() {
++		once.Do(func() {
++			close(stopping)
++			_ = connection.Close()
++			select {
++			case <-done:
++			case <-time.After(2 * time.Second):
++				_ = cmd.Process.Kill()
++				<-done
++			}
++		})
++	}
++	_ = connection.SetReadDeadline(time.Now().Add(10 * time.Second))
++	reader := bufio.NewReaderSize(connection, MaxFrame)
++	read := func() ([]string, error) {
++		frame, err := reader.ReadSlice('\n')
++		if err != nil {
++			return nil, err
++		}
++		return decodeSnapshot(frame)
++	}
++	servers, err := read()
++	if err != nil {
++		stop()
++		return nil, fmt.Errorf("system DNS initial snapshot: %w", err)
++	}
++	update(servers)
++	_ = connection.SetReadDeadline(time.Time{})
++	go func() {
++		for {
++			next, err := read()
++			if err != nil {
++				select {
++				case <-stopping:
++					return
++				default:
++				}
++				update(nil)
++				failed(fmt.Errorf("system DNS channel failed: %w", err))
++				return
++			}
++			// The observer also notifies when the network changes but its DNS does not.
++			update(next)
++		}
++	}()
++	return stop, nil
++}
+diff --git a/component/systemdns/client_test.go b/component/systemdns/client_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..62809855964329808e520a7164d41953af1106f1
+--- /dev/null
++++ b/component/systemdns/client_test.go
+@@ -0,0 +1,130 @@
++//go:build linux
++
++package systemdns
++
++import (
++	"fmt"
++	"io"
++	"os"
++	"os/exec"
++	"reflect"
++	"strings"
++	"syscall"
++	"testing"
++	"time"
++)
++
++// Run in a subprocess to exercise real inherited descriptors and parent EOF.
++func TestSystemDNSProcess(t *testing.T) {
++	mode, child := strings.CutPrefix(os.Args[len(os.Args)-1], "--system-dns-child=")
++	if !child {
++		return
++	}
++	output := os.NewFile(3, "snapshots")
++	if mode == "bad-start" {
++		fmt.Fprintln(output, `{"version":2,"servers":[]}`)
++		os.Exit(0)
++	}
++	fmt.Fprintln(output, `{"version":1,"servers":["192.0.2.1:53"]}`)
++	switch mode {
++	case "changes":
++		// A new physical network can advertise the same DNS endpoints.
++		fmt.Fprintln(output, `{"version":1,"servers":["192.0.2.1:53"]}`)
++		fmt.Fprintln(output, `{"version":1,"servers":[]}`)
++		fmt.Fprintln(output, `{"version":1,"servers":["[fe80::1%wlan0]:53"]}`)
++	case "disconnect":
++		os.Exit(0)
++	case "invalid":
++		fmt.Fprintln(output, `{"version":1,"servers":["127.0.0.1:53"]}`)
++	case "oversized":
++		fmt.Fprint(output, strings.Repeat(" ", MaxFrame))
++	}
++	_, _ = io.Copy(io.Discard, os.Stdin)
++	os.Exit(0)
++}
++
++func helperCommand(mode string) *exec.Cmd {
++	return exec.Command(os.Args[0], "-test.run=^TestSystemDNSProcess$", "--", "--system-dns-child="+mode)
++}
++
++func TestClientUpdatesAndShutdown(t *testing.T) {
++	updates := make(chan []string, 8)
++	failed := make(chan error, 1)
++	cmd := helperCommand("changes")
++	stop, err := start(cmd, func(servers []string) { updates <- servers }, func(err error) { failed <- err })
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer stop()
++	for _, want := range [][]string{{"192.0.2.1:53"}, {"192.0.2.1:53"}, {}, {"[fe80::1%wlan0]:53"}} {
++		select {
++		case got := <-updates:
++			if !reflect.DeepEqual(got, want) {
++				t.Fatalf("snapshot = %v, want %v", got, want)
++			}
++		case <-time.After(5 * time.Second):
++			t.Fatal("missing DNS change")
++		}
++	}
++	stop()
++	stop()
++	if !cmd.ProcessState.Success() {
++		t.Fatalf("helper did not exit on stdin EOF: %v", cmd.ProcessState)
++	}
++	select {
++	case err := <-failed:
++		t.Fatalf("normal shutdown reported failure: %v", err)
++	default:
++	}
++}
++
++func TestClientWithdrawsDNSOnFailure(t *testing.T) {
++	for _, mode := range []string{"disconnect", "invalid", "oversized"} {
++		t.Run(mode, func(t *testing.T) {
++			updates := make(chan []string, 8)
++			failed := make(chan error, 1)
++			stop, err := start(helperCommand(mode), func(servers []string) { updates <- servers }, func(err error) { failed <- err })
++			if err != nil {
++				t.Fatal(err)
++			}
++			defer stop()
++			select {
++			case err := <-failed:
++				if err == nil || len(<-updates) != 1 || <-updates != nil {
++					t.Fatal("helper failure did not withdraw DNS")
++				}
++			case <-time.After(5 * time.Second):
++				t.Fatal("helper failure was not reported")
++			}
++		})
++	}
++}
++
++func TestClientStartupFailure(t *testing.T) {
++	for _, cmd := range []*exec.Cmd{exec.Command("/nonexistent/system-dns-helper"), helperCommand("bad-start")} {
++		_, err := start(cmd, func([]string) { t.Error("invalid initial snapshot was applied") },
++			func(error) { t.Error("startup failure reported as runtime failure") })
++		if err == nil {
++			t.Fatal("startup succeeded")
++		}
++		if cmd.Process != nil && cmd.ProcessState == nil {
++			t.Fatal("failed helper was not reaped")
++		}
++	}
++}
++
++func TestClientKillsUnresponsiveHelper(t *testing.T) {
++	cmd := helperCommand("idle")
++	stop, err := start(cmd, func([]string) {}, func(error) {})
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer stop()
++	if err := cmd.Process.Signal(syscall.SIGSTOP); err != nil {
++		t.Fatal(err)
++	}
++	stop()
++	if cmd.ProcessState.Sys().(syscall.WaitStatus).Signal() != syscall.SIGKILL {
++		t.Fatal("unresponsive helper was not killed")
++	}
++}
+diff --git a/component/systemdns/helper.go b/component/systemdns/helper.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..49eb47aeaf6714939463b5e94c7aadb256adf6e9
+--- /dev/null
++++ b/component/systemdns/helper.go
+@@ -0,0 +1,104 @@
++//go:build android || linux
++
++package systemdns
++
++import (
++	"bytes"
++	"fmt"
++	"io"
++	"os"
++	"path/filepath"
++	"syscall"
++	"time"
++
++	"golang.org/x/sys/unix"
++)
++
++const (
++	helperFilename = "system-dns-helper.dex"
++	tempPattern    = ".system-dns-helper-*.dex"
++)
++
++// A core killed while replacing the dex leaves its temporary behind. Skip
++// recent files in case another process is still writing one.
++func removeStaleTemporaries(home string) {
++	names, _ := filepath.Glob(filepath.Join(home, tempPattern))
++	for _, name := range names {
++		if info, err := os.Lstat(name); err == nil && info.Mode().IsRegular() &&
++			time.Since(info.ModTime()) > time.Minute {
++			_ = os.Remove(name)
++		}
++	}
++}
++
++// Retain the real path and ART's sibling oat cache across process exits.
++// Android 8's class loader cannot open an already unlinked dex through procfs.
++func ensureHelper(home string, payload []byte) (string, error) {
++	home, err := filepath.Abs(home)
++	if err != nil {
++		return "", err
++	}
++	if err = os.MkdirAll(home, 0700); err != nil {
++		return "", err
++	}
++	path := filepath.Join(home, helperFilename)
++	match, err := helperMatches(path, payload)
++	if err != nil || match {
++		return path, err
++	}
++	removeStaleTemporaries(home)
++	file, err := os.CreateTemp(home, tempPattern)
++	if err != nil {
++		return "", err
++	}
++	defer os.Remove(file.Name())
++	defer file.Close()
++	if _, err = file.Write(payload); err != nil {
++		return "", err
++	}
++	if err = file.Chmod(0400); err != nil {
++		return "", err
++	}
++	if err = file.Sync(); err != nil {
++		return "", err
++	}
++	if err = file.Close(); err != nil {
++		return "", err
++	}
++	if err = os.Rename(file.Name(), path); err != nil {
++		return "", err
++	}
++	return path, nil
++}
++
++func helperMatches(path string, payload []byte) (bool, error) {
++	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW|unix.O_NONBLOCK, 0)
++	if err == unix.ENOENT || err == unix.ELOOP {
++		return false, nil
++	}
++	if err != nil {
++		return false, err
++	}
++	file := os.NewFile(uintptr(fd), path)
++	defer file.Close()
++	info, err := file.Stat()
++	if err != nil {
++		return false, err
++	}
++	if !info.Mode().IsRegular() {
++		return false, fmt.Errorf("system DNS helper is not a regular file")
++	}
++	if info.Sys().(*syscall.Stat_t).Uid != uint32(os.Geteuid()) || info.Size() != int64(len(payload)) {
++		return false, nil
++	}
++	content, err := io.ReadAll(io.LimitReader(file, int64(len(payload))+1))
++	if err != nil || !bytes.Equal(content, payload) {
++		return false, err
++	}
++	if info.Mode().Perm() != 0400 {
++		if err = file.Chmod(0400); err != nil {
++			return false, err
++		}
++	}
++	return true, nil
++}
+diff --git a/component/systemdns/helper_test.go b/component/systemdns/helper_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..6adb7bcfaf77435bd32732a71210f05316857205
+--- /dev/null
++++ b/component/systemdns/helper_test.go
+@@ -0,0 +1,96 @@
++//go:build android || linux
++
++package systemdns
++
++import (
++	"bytes"
++	"os"
++	"path/filepath"
++	"testing"
++	"time"
++)
++
++func TestHelperReuseAndReplacement(t *testing.T) {
++	home := t.TempDir()
++	payload := []byte("current embedded dex")
++	path, err := ensureHelper(home, payload)
++	if err != nil {
++		t.Fatal(err)
++	}
++	// Reuse preserves file identity/mtime, allowing ART to retain its cache.
++	oldTime := time.Unix(1234567890, 0)
++	if err := os.Chtimes(path, oldTime, oldTime); err != nil {
++		t.Fatal(err)
++	}
++	before, _ := os.Stat(path)
++	if _, err = ensureHelper(home, payload); err != nil {
++		t.Fatal(err)
++	}
++	after, _ := os.Stat(path)
++	if !os.SameFile(before, after) || !after.ModTime().Equal(oldTime) || after.Mode().Perm() != 0400 {
++		t.Fatal("matching helper was rewritten or has incorrect permissions")
++	}
++	for _, stale := range [][]byte{[]byte("old version"), []byte("xurrent embedded dex"), nil} {
++		if err := os.Chmod(path, 0600); err != nil {
++			t.Fatal(err)
++		}
++		if err := os.WriteFile(path, stale, 0600); err != nil {
++			t.Fatal(err)
++		}
++		before, _ := os.Stat(path)
++		if _, err := ensureHelper(home, payload); err != nil {
++			t.Fatal(err)
++		}
++		content, err := os.ReadFile(path)
++		after, _ := os.Stat(path)
++		if err != nil || !bytes.Equal(content, payload) || os.SameFile(before, after) || after.Mode().Perm() != 0400 {
++			t.Fatal("stale helper was not atomically replaced")
++		}
++	}
++	files, _ := os.ReadDir(home)
++	if len(files) != 1 || files[0].Name() != helperFilename {
++		t.Fatal("temporary files left behind")
++	}
++}
++
++func TestHelperDoesNotFollowSymlink(t *testing.T) {
++	home := t.TempDir()
++	target := filepath.Join(t.TempDir(), "unrelated")
++	if err := os.WriteFile(target, []byte("keep"), 0600); err != nil {
++		t.Fatal(err)
++	}
++	if err := os.Symlink(target, filepath.Join(home, helperFilename)); err != nil {
++		t.Fatal(err)
++	}
++	if _, err := ensureHelper(home, []byte("embedded dex")); err != nil {
++		t.Fatal(err)
++	}
++	content, err := os.ReadFile(target)
++	if err != nil || string(content) != "keep" {
++		t.Fatal("helper update changed the symlink target")
++	}
++}
++
++func TestHelperRemovesStaleTemporaries(t *testing.T) {
++	home := t.TempDir()
++	stale := filepath.Join(home, ".system-dns-helper-stale.dex")
++	fresh := filepath.Join(home, ".system-dns-helper-fresh.dex")
++	for _, name := range []string{stale, fresh} {
++		if err := os.WriteFile(name, []byte("partial"), 0600); err != nil {
++			t.Fatal(err)
++		}
++	}
++	oldTime := time.Now().Add(-time.Hour)
++	if err := os.Chtimes(stale, oldTime, oldTime); err != nil {
++		t.Fatal(err)
++	}
++	if _, err := ensureHelper(home, []byte("embedded dex")); err != nil {
++		t.Fatal(err)
++	}
++	if _, err := os.Lstat(stale); !os.IsNotExist(err) {
++		t.Fatal("stale temporary helper was not removed")
++	}
++	if _, err := os.Lstat(fresh); err != nil {
++		t.Fatal("recent temporary helper was removed")
++	}
++}
+diff --git a/component/systemdns/java/SystemDnsHelper.java b/component/systemdns/java/SystemDnsHelper.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..95bfd20997665f2be98693188a48c8be879e2a9e
+--- /dev/null
++++ b/component/systemdns/java/SystemDnsHelper.java
+@@ -0,0 +1,230 @@
++// Copyright 2026, AsteriskMETA contributors
++// SPDX-License-Identifier: GPL-3.0
++package mihomo.systemdns;
++
++import android.annotation.SuppressLint;
++import android.content.Context;
++import android.net.ConnectivityManager;
++import android.net.LinkProperties;
++import android.net.Network;
++import android.net.NetworkCapabilities;
++import android.net.NetworkRequest;
++import android.os.Build;
++import android.os.Handler;
++import android.os.HandlerThread;
++import android.os.IBinder;
++import android.os.Looper;
++import android.os.ParcelFileDescriptor;
++import android.os.Process;
++
++import org.json.JSONArray;
++import org.json.JSONObject;
++
++import java.io.FileOutputStream;
++import java.io.IOException;
++import java.io.OutputStream;
++import java.net.Inet6Address;
++import java.net.InetAddress;
++import java.nio.charset.StandardCharsets;
++import java.util.ArrayList;
++import java.util.Arrays;
++import java.util.HashMap;
++import java.util.HashSet;
++import java.util.LinkedHashSet;
++import java.util.List;
++import java.util.Map;
++import java.util.Set;
++import java.util.concurrent.CountDownLatch;
++import java.util.concurrent.atomic.AtomicReference;
++
++/** Standalone app_process entry point. No Application, Activity, JNI or DNS queries. */
++public final class SystemDnsHelper {
++    private final ConnectivityManager connectivity;
++    private final HandlerThread worker = new HandlerThread("SystemDnsNetwork");
++    private final Set<Network> lostNetworks = new HashSet<>();
++    private final Object changed = new Object();
++    private byte[] snapshot;
++    private List<Network> selectedNetworks = new ArrayList<>();
++    private long generation;
++
++    private static final class State {
++        NetworkCapabilities capabilities;
++        LinkProperties properties;
++    }
++
++    private SystemDnsHelper(Context context) {
++        connectivity = context.getSystemService(ConnectivityManager.class);
++    }
++
++    public static void main(String[] args) {
++        try {
++            if (Process.myUid() != 0 || args.length != 1) {
++                throw new IllegalArgumentException("System DNS helper requires root and an inherited socket fd");
++            }
++            int fd = Integer.parseInt(args[0]);
++            if (fd < 3) throw new IllegalArgumentException("Invalid system DNS socket fd");
++            ParcelFileDescriptor transport = ParcelFileDescriptor.adoptFd(fd);
++            Looper.prepareMainLooper();
++            SystemDnsHelper helper = new SystemDnsHelper(systemContext());
++            // stdin is the inherited socketpair endpoint. Closing the core's
++            // endpoint ends this observer without an app lifecycle callback.
++            Thread parent = new Thread(() -> {
++                try { while (System.in.read() != -1) { } } catch (IOException ignored) { }
++                System.exit(0);
++            }, "SystemDnsParent");
++            parent.setDaemon(true);
++            parent.start();
++            try (ParcelFileDescriptor owned = transport) {
++                helper.run(new FileOutputStream(owned.getFileDescriptor()));
++            }
++        } catch (Throwable error) {
++            error.printStackTrace(System.err);
++            System.exit(1);
++        }
++    }
++
++    // app_process has no app Context. This intentional root-only bootstrap and
++    // the death link below are the only hidden-API boundaries; public SDK calls
++    // handle Connectivity Binder.
++    @SuppressLint("PrivateApi")
++    private static Context systemContext() throws ReflectiveOperationException {
++        Class<?> activityThread = Class.forName("android.app.ActivityThread");
++        Object thread = activityThread.getMethod("systemMain").invoke(null);
++        return (Context) activityThread.getMethod("getSystemContext").invoke(thread);
++    }
++
++    // Callbacks live in system_server. After it restarts this process would keep
++    // running without them and the core would retain stale DNS, so treat the
++    // service's death like any other helper failure.
++    @SuppressLint("PrivateApi")
++    private static void exitWithConnectivityService() throws Exception {
++        IBinder service = (IBinder) Class.forName("android.os.ServiceManager")
++                .getMethod("getService", String.class).invoke(null, Context.CONNECTIVITY_SERVICE);
++        if (service == null) throw new IllegalStateException("Connectivity service unavailable");
++        service.linkToDeath(() -> {
++            System.err.println("Connectivity service died; system DNS helper exiting");
++            System.exit(1);
++        }, 0);
++    }
++
++    private void run(OutputStream output) throws Exception {
++        exitWithConnectivityService();
++        worker.start();
++        Handler handler = new Handler(worker.getLooper());
++        ConnectivityManager.NetworkCallback callback = new ConnectivityManager.NetworkCallback() {
++            @Override public void onAvailable(Network network) { lostNetworks.remove(network); publish(); }
++            @Override public void onCapabilitiesChanged(Network network, NetworkCapabilities caps) {
++                publish();
++            }
++            @Override public void onLinkPropertiesChanged(Network network, LinkProperties properties) {
++                publish();
++            }
++            @Override public void onLost(Network network) { lostNetworks.add(network); publish(); }
++        };
++        NetworkRequest.Builder builder = new NetworkRequest.Builder();
++        if (Build.VERSION.SDK_INT >= 30) {
++            builder.clearCapabilities();
++        } else {
++            builder.removeCapability(NetworkCapabilities.NET_CAPABILITY_TRUSTED)
++                    .removeCapability(NetworkCapabilities.NET_CAPABILITY_NOT_RESTRICTED);
++        }
++        NetworkRequest request = builder
++                .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
++                .addCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN).build();
++        connectivity.registerNetworkCallback(request, callback, handler);
++        connectivity.registerDefaultNetworkCallback(new ConnectivityManager.NetworkCallback() {
++            @Override public void onAvailable(Network network) { publish(); }
++            @Override public void onLost(Network network) { publish(); }
++            @Override public void onCapabilitiesChanged(Network network, NetworkCapabilities caps) { publish(); }
++        }, handler);
++        CountDownLatch initialized = new CountDownLatch(1);
++        AtomicReference<Throwable> failure = new AtomicReference<>();
++        handler.post(() -> {
++            try {
++                publish();
++            } catch (Throwable error) { failure.set(error); }
++            finally { initialized.countDown(); }
++        });
++        initialized.await();
++        if (failure.get() != null) throw new IllegalStateException("Cannot read network DNS", failure.get());
++        System.out.print("READY 1\n");
++        System.out.flush();
++        // The owning core drains this socketpair. Callbacks only replace the
++        // latest immutable frame; no DNS query passes through Android.
++        serve(output, -1);
++    }
++
++    private void publish() {
++        try {
++            Network active = connectivity.getActiveNetwork();
++            // Callbacks are invalidations, not a second source of truth. A network
++            // found at startup may be lingering/background and never have matched
++            // the callback request, so retaining its cached LP can miss its loss.
++            List<Network> current = Arrays.asList(connectivity.getAllNetworks());
++            lostNetworks.retainAll(current);
++            Map<Network, State> networks = new HashMap<>();
++            List<Network> eligible = new ArrayList<>();
++            for (Network network : current) {
++                if (lostNetworks.contains(network)) continue;
++                State state = new State();
++                state.capabilities = connectivity.getNetworkCapabilities(network);
++                state.properties = connectivity.getLinkProperties(network);
++                networks.put(network, state);
++                if (state.capabilities != null && state.properties != null
++                        && state.capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
++                        && state.capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
++                        && !state.properties.getDnsServers().isEmpty()) eligible.add(network);
++            }
++            eligible.sort((a, b) -> Long.compare(a.getNetworkHandle(), b.getNetworkHandle()));
++            boolean hasActive = eligible.contains(active);
++            boolean hasValidated = false;
++            for (Network network : eligible) {
++                hasValidated |= networks.get(network).capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED);
++            }
++            LinkedHashSet<String> servers = new LinkedHashSet<>();
++            List<Network> selected = new ArrayList<>();
++            for (Network network : eligible) {
++                State state = networks.get(network);
++                if (hasActive ? !network.equals(active) : hasValidated
++                        && !state.capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)) continue;
++                selected.add(network);
++                for (InetAddress address : state.properties.getDnsServers()) {
++                    if (address.isAnyLocalAddress() || address.isLoopbackAddress() || address.isMulticastAddress()) continue;
++                    // Preserve Android's scope ID for link-local IPv6 servers.
++                    String host = address.getHostAddress();
++                    servers.add(address instanceof Inet6Address ? "[" + host + "]:53" : host + ":53");
++                    if (servers.size() == 32) break;
++                }
++                if (servers.size() == 32) break;
++            }
++            byte[] next = (new JSONObject().put("version", 1)
++                    .put("servers", new JSONArray(servers)).toString() + "\n").getBytes(StandardCharsets.UTF_8);
++            synchronized (changed) {
++                // Different links can advertise the same DNS endpoints.
++                if (!Arrays.equals(snapshot, next) || !selectedNetworks.equals(selected)) {
++                    snapshot = next;
++                    selectedNetworks = selected;
++                    generation++;
++                    changed.notifyAll();
++                }
++            }
++        } catch (Throwable error) {
++            // Do not leave the core using stale DNS after a failed callback.
++            error.printStackTrace(System.err);
++            System.exit(1);
++        }
++    }
++
++    private void serve(OutputStream output, long sent) throws IOException, InterruptedException {
++        for (;;) {
++            byte[] next;
++            synchronized (changed) {
++                while (sent == generation) changed.wait();
++                next = snapshot;
++                sent = generation;
++            }
++            output.write(next);
++            output.flush();
++        }
++    }
++}
+diff --git a/component/systemdns/protocol.go b/component/systemdns/protocol.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..eacb29b732527c12d13b24e983085ec339be7949
+--- /dev/null
++++ b/component/systemdns/protocol.go
+@@ -0,0 +1,46 @@
++// Package systemdns consumes DNS configuration, never Android DNS queries.
++package systemdns
++
++import (
++	"bytes"
++	"encoding/json"
++	"fmt"
++	"io"
++	"net/netip"
++)
++
++const MaxFrame = 8192
++
++func decodeSnapshot(frame []byte) ([]string, error) {
++	if len(frame) > MaxFrame {
++		return nil, fmt.Errorf("system DNS snapshot exceeds frame limit")
++	}
++	var snapshot struct {
++		Version int      `json:"version"`
++		Servers []string `json:"servers"`
++	}
++	decoder := json.NewDecoder(bytes.NewReader(frame))
++	decoder.DisallowUnknownFields()
++	if err := decoder.Decode(&snapshot); err != nil {
++		return nil, err
++	}
++	if decoder.Decode(new(any)) != io.EOF || snapshot.Version != 1 || snapshot.Servers == nil || len(snapshot.Servers) > 32 {
++		return nil, fmt.Errorf("invalid system DNS snapshot")
++	}
++	seen := make(map[string]bool)
++	servers := make([]string, 0, len(snapshot.Servers))
++	for _, server := range snapshot.Servers {
++		endpoint, err := netip.ParseAddrPort(server)
++		address := endpoint.Addr().Unmap()
++		if err != nil || endpoint.Port() != 53 || address.IsUnspecified() ||
++			address.IsLoopback() || address.IsMulticast() {
++			return nil, fmt.Errorf("invalid system DNS endpoint")
++		}
++		server = endpoint.String()
++		if !seen[server] {
++			seen[server] = true
++			servers = append(servers, server)
++		}
++	}
++	return servers, nil
++}
+diff --git a/component/systemdns/protocol_test.go b/component/systemdns/protocol_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..ccf9a3c7389328bf1f5d03cdc76f4a9903cf6e9f
+--- /dev/null
++++ b/component/systemdns/protocol_test.go
+@@ -0,0 +1,37 @@
++package systemdns
++
++import (
++	"reflect"
++	"strings"
++	"testing"
++)
++
++func TestSnapshots(t *testing.T) {
++	for _, frame := range []string{
++		`{"version":1,"servers":[]}`,
++		`{"version":1,"servers":["192.0.2.1:53","[2001:db8::1]:53","[fe80::1%wlan0]:53"]}`,
++	} {
++		if _, err := decodeSnapshot([]byte(frame)); err != nil {
++			t.Fatalf("valid snapshot: %v", err)
++		}
++	}
++	for _, frame := range []string{
++		`{"version":2,"servers":[]}`, `{"version":1}`, `{"version":1,"servers":null}`,
++		`{"version":1,"servers":["example.com:53"]}`, `{"version":1,"servers":["192.0.2.1:5353"]}`,
++		`{"version":1,"servers":["127.0.0.1:53"]}`, `{"version":1,"servers":["[::]:53"]}`,
++		`{"version":1,"servers":["224.0.0.1:53"]}`, `{"version":1,"servers":["[ff02::1]:53"]}`,
++		`{"version":1,"servers":["[::ffff:127.0.0.1]:53"]}`, `{"version":1,"servers":["[::ffff:0.0.0.0]:53"]}`,
++		`{"version":1,"servers":["[::ffff:224.0.0.1]:53"]}`,
++		`{"version":1,"servers":[` + strings.Repeat(`"192.0.2.1:53",`, 32) + `"192.0.2.1:53"]}`,
++		`{"version":1,"servers":[]}` + strings.Repeat(" ", MaxFrame),
++		`{"version":1,"servers":[]} {}`, `{"version":1,"servers":[],"query":"example.com"}`,
++	} {
++		if _, err := decodeSnapshot([]byte(frame)); err == nil {
++			t.Fatalf("accepted invalid snapshot: %s", frame)
++		}
++	}
++	got, err := decodeSnapshot([]byte(`{"version":1,"servers":["[2001:0db8::1]:53","[2001:db8::1]:53","192.0.2.1:53"]}`))
++	if err != nil || !reflect.DeepEqual(got, []string{"[2001:db8::1]:53", "192.0.2.1:53"}) {
++		t.Fatalf("snapshot normalization = %v, %v", got, err)
++	}
++}
+diff --git a/component/systemdns/start_android.go b/component/systemdns/start_android.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..7f4453bcf771accf612e3e9605412aed5c8ad27a
+--- /dev/null
++++ b/component/systemdns/start_android.go
+@@ -0,0 +1,28 @@
++//go:build !cmfa
++
++package systemdns
++
++import (
++	_ "embed"
++	"fmt"
++	"os"
++	"os/exec"
++)
++
++//go:embed helper.dex
++var helperDex []byte
++
++// Start observes physical-network DNS for a standalone Android root process.
++// Callbacks must not block; later updates and failures run on the reader goroutine.
++func Start(home string, update func([]string), failed func(error)) (func(), error) {
++	if os.Geteuid() != 0 {
++		return func() {}, nil
++	}
++	path, err := ensureHelper(home, helperDex)
++	if err != nil {
++		return nil, fmt.Errorf("system DNS helper file: %w", err)
++	}
++	cmd := exec.Command("/system/bin/app_process", "-Djava.class.path="+path, "/",
++		"--nice-name=mihomo-system-dns", "mihomo.systemdns.SystemDnsHelper", "3")
++	return start(cmd, update, failed)
++}
+diff --git a/component/systemdns/start_other.go b/component/systemdns/start_other.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..20ad4d62c60d5c7dea88124b0db8874f8f930870
+--- /dev/null
++++ b/component/systemdns/start_other.go
+@@ -0,0 +1,7 @@
++//go:build !android || cmfa
++
++package systemdns
++
++func Start(home string, update func([]string), failed func(error)) (func(), error) {
++	return func() {}, nil
++}
+diff --git a/component/systemdns/test_observer.py b/component/systemdns/test_observer.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..be66910ca546643122e5e905733888d561db124b
+--- /dev/null
++++ b/component/systemdns/test_observer.py
+@@ -0,0 +1,183 @@
++#!/usr/bin/env python3
++"""Run the real observer's selection/publication code against fake Android services.
++
++These host tests do not exercise Binder, SELinux or Android callback delivery.
++"""
++
++import os
++from pathlib import Path
++import subprocess
++import tempfile
++
++
++SOURCES = {
++    "android/content/Context.java": """
++package android.content;
++public class Context {
++    public static final String CONNECTIVITY_SERVICE = "connectivity";
++    public Object service;
++    public <T> T getSystemService(Class<T> type) { return type.cast(service); }
++}
++""",
++    "android/os/HandlerThread.java": """
++package android.os;
++public class HandlerThread extends Thread {
++    public HandlerThread(String name) { super(name); }
++    public Looper getLooper() { return null; }
++}
++""",
++    "android/net/Network.java": """
++package android.net;
++public class Network {
++    private final long handle;
++    public Network(long handle) { this.handle = handle; }
++    public long getNetworkHandle() { return handle; }
++    public boolean equals(Object other) {
++        return other instanceof Network && ((Network) other).handle == handle;
++    }
++    public int hashCode() { return Long.hashCode(handle); }
++}
++""",
++    "android/net/NetworkCapabilities.java": """
++package android.net;
++public class NetworkCapabilities {
++    public static final int NET_CAPABILITY_INTERNET = 12, NET_CAPABILITY_NOT_RESTRICTED = 13,
++        NET_CAPABILITY_TRUSTED = 14, NET_CAPABILITY_NOT_VPN = 15, NET_CAPABILITY_VALIDATED = 16;
++    public boolean vpn;
++    public boolean hasCapability(int value) { return value != NET_CAPABILITY_NOT_VPN || !vpn; }
++}
++""",
++    "android/net/LinkProperties.java": """
++package android.net;
++public class LinkProperties {
++    private final java.util.List<java.net.InetAddress> servers;
++    public LinkProperties(String address) throws Exception {
++        servers = java.util.Collections.singletonList(java.net.InetAddress.getByName(address));
++    }
++    public java.util.List<java.net.InetAddress> getDnsServers() { return servers; }
++}
++""",
++    "android/net/ConnectivityManager.java": """
++package android.net;
++public class ConnectivityManager {
++    public Network active;
++    public Network[] current;
++    public final java.util.Map<Network, NetworkCapabilities> caps = new java.util.HashMap<>();
++    public final java.util.Map<Network, LinkProperties> links = new java.util.HashMap<>();
++    public Network getActiveNetwork() { return active; }
++    public Network[] getAllNetworks() { return current; }
++    public NetworkCapabilities getNetworkCapabilities(Network n) { return caps.get(n); }
++    public LinkProperties getLinkProperties(Network n) { return links.get(n); }
++    public void registerNetworkCallback(NetworkRequest r, NetworkCallback c, android.os.Handler h) { }
++    public void registerDefaultNetworkCallback(NetworkCallback c, android.os.Handler h) { }
++    public static class NetworkCallback {
++        public void onAvailable(Network n) { }
++        public void onLost(Network n) { }
++        public void onCapabilitiesChanged(Network n, NetworkCapabilities c) { }
++        public void onLinkPropertiesChanged(Network n, LinkProperties p) { }
++    }
++}
++""",
++    "org/json/JSONArray.java": """
++package org.json;
++public class JSONArray {
++    private final java.util.Collection<?> values;
++    public JSONArray(java.util.Collection<?> values) { this.values = values; }
++    public String toString() {
++        return values.stream().map(v -> "\\\"" + v + "\\\"")
++            .collect(java.util.stream.Collectors.joining(",", "[", "]"));
++    }
++}
++""",
++    "org/json/JSONObject.java": """
++package org.json;
++public class JSONObject {
++    private final java.util.Map<String, Object> values = new java.util.LinkedHashMap<>();
++    public JSONObject put(String key, Object value) { values.put(key, value); return this; }
++    public String toString() {
++        return values.entrySet().stream().map(e -> "\\\"" + e.getKey() + "\\\":" + e.getValue())
++            .collect(java.util.stream.Collectors.joining(",", "{", "}"));
++    }
++}
++""",
++    "ObserverTest.java": """
++import android.content.Context;
++import android.net.*;
++import java.lang.reflect.*;
++import java.nio.charset.StandardCharsets;
++import java.util.Arrays;
++import mihomo.systemdns.SystemDnsHelper;
++
++public class ObserverTest {
++    public static void main(String[] args) throws Exception {
++        ConnectivityManager cm = new ConnectivityManager();
++        Context context = new Context();
++        context.service = cm;
++        Constructor<SystemDnsHelper> constructor = SystemDnsHelper.class.getDeclaredConstructor(Context.class);
++        constructor.setAccessible(true);
++        Object helper = constructor.newInstance(context);
++        Method publish = SystemDnsHelper.class.getDeclaredMethod("publish");
++        publish.setAccessible(true);
++        Field generation = SystemDnsHelper.class.getDeclaredField("generation");
++        Field snapshot = SystemDnsHelper.class.getDeclaredField("snapshot");
++        generation.setAccessible(true);
++        snapshot.setAccessible(true);
++        Network a = new Network(100), b = new Network(101), vpn = new Network(102);
++        for (Network n : new Network[]{a, b, vpn}) {
++            cm.caps.put(n, new NetworkCapabilities());
++            cm.links.put(n, new LinkProperties("192.0.2.1"));
++        }
++        cm.caps.get(vpn).vpn = true;
++        cm.current = new Network[]{a, b};
++        cm.active = a;
++        publish.invoke(helper);
++        byte[] first = (byte[]) snapshot.get(helper);
++        assert generation.getLong(helper) == 1;
++        publish.invoke(helper);
++        assert generation.getLong(helper) == 1 : "unchanged callbacks should be coalesced";
++        cm.active = b;
++        publish.invoke(helper);
++        assert generation.getLong(helper) == 2 : "same-DNS network handover was lost";
++        assert Arrays.equals(first, (byte[]) snapshot.get(helper)) : "the address protocol changed";
++        cm.links.put(b, new LinkProperties("192.0.2.2"));
++        publish.invoke(helper);
++        assert generation.getLong(helper) == 3 : "DNS-only change was lost";
++        // Startup scans can see a network that later disappears without a matching onLost.
++        cm.current = new Network[]{a, vpn};
++        cm.active = vpn;
++        publish.invoke(helper);
++        assert generation.getLong(helper) == 4;
++        assert Arrays.equals(first, (byte[]) snapshot.get(helper)) : "stale startup DNS was retained";
++        cm.current = new Network[]{vpn};
++        publish.invoke(helper);
++        assert new String((byte[]) snapshot.get(helper), StandardCharsets.UTF_8).contains("\\\"servers\\\":[]")
++            : "VPN/offline state did not withdraw physical DNS";
++        System.out.println("PASS: same-DNS handover, duplicate callback, DNS change, stale network and VPN/offline");
++    }
++}
++""",
++}
++
++
++def main():
++    root = Path(__file__).resolve().parent
++    android = Path(os.environ["ANDROID_HOME"]) / "platforms/android-36/android.jar"
++    java_bin = Path(os.environ["JAVA_HOME"]) / "bin" if os.environ.get("JAVA_HOME") else Path()
++    with tempfile.TemporaryDirectory(prefix="mihomo-observer-test-") as tmp:
++        tmp = Path(tmp)
++        sources = []
++        for name, source in SOURCES.items():
++            path = tmp / name
++            path.parent.mkdir(parents=True, exist_ok=True)
++            path.write_text(source)
++            sources.append(str(path))
++        classes = tmp / "classes"
++        classes.mkdir()
++        subprocess.run([str(java_bin / "javac"), "--release", "8", "-Xlint:-options", "-cp", str(android),
++                        "-d", str(classes), *sources, str(root / "java/SystemDnsHelper.java")], check=True)
++        subprocess.run([str(java_bin / "java"), "-ea", "-cp", str(classes) + os.pathsep + str(android),
++                        "ObserverTest"], check=True)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/dns/system_common.go b/dns/system_common.go
+index e6dabdcfff1411b8115c3f50b1fbcda5826a6ec1..65b8f6b9a04933e4fe8329dcb1741125ab75047c 100644
+--- a/dns/system_common.go
++++ b/dns/system_common.go
+@@ -13,6 +13,9 @@ import (
+ )
+ 
+ func (c *systemClient) getDnsClients() ([]dnsClient, error) {
++	if clients := systemResolver.Load(); clients != nil {
++		return *clients, nil
++	}
+ 	c.mu.Lock()
+ 	defer c.mu.Unlock()
+ 	var err error
+@@ -70,4 +73,10 @@ func (c *systemClient) getDnsClients() ([]dnsClient, error) {
+ 	return nil, err
+ }
+ 
+-func (c *systemClient) ResetConnection() {}
++func (c *systemClient) ResetConnection() {
++	if clients := systemResolver.Load(); clients != nil {
++		for _, client := range *clients {
++			client.ResetConnection()
++		}
++	}
++}
+diff --git a/dns/system_snapshot.go b/dns/system_snapshot.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..0736ab359583324064b822c46d340911050dad5c
+--- /dev/null
++++ b/dns/system_snapshot.go
+@@ -0,0 +1,26 @@
++//go:build !(android && cmfa)
++
++package dns
++
++import (
++	"sync/atomic"
++
++	"github.com/metacubex/mihomo/component/resolver"
++)
++
++// nil uses native discovery; a published empty slice withdraws all managed DNS.
++var systemResolver atomic.Pointer[[]dnsClient]
++
++func UpdateSystemDNS(addr []string) {
++	ns := make([]NameServer, 0, len(addr))
++	for _, d := range addr {
++		ns = append(ns, NameServer{Addr: d})
++	}
++	clients := transform(ns, nil)
++	systemResolver.Store(&clients)
++}
++
++func FlushCacheWithDefaultResolver() {
++	resolver.ClearCache()
++	resolver.ResetConnection()
++}
+diff --git a/dns/system_snapshot_test.go b/dns/system_snapshot_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..db285c27264e5c24408d728d8fe01c60e3687333
+--- /dev/null
++++ b/dns/system_snapshot_test.go
+@@ -0,0 +1,78 @@
++//go:build !(android && cmfa)
++
++package dns
++
++import (
++	"context"
++	"net"
++	"sync"
++	"testing"
++	"time"
++
++	D "github.com/miekg/dns"
++)
++
++func TestManagedSystemDNS(t *testing.T) {
++	t.Cleanup(func() { systemResolver.Store(nil) })
++	system := []NameServer{{Net: "system"}}
++	main := NewResolver(Config{Main: system, DirectServer: system})
++	policy := NewResolver(Config{Main: []NameServer{{Net: "rcode", Addr: "refused"}},
++		Policy: []Policy{{Domain: "system-dns.test", NameServers: system}}})
++	for _, answer := range []string{"192.0.2.10", "192.0.2.20"} {
++		answer := answer // Go 1.20 shares range variables with the DNS handler.
++		conn, err := net.ListenPacket("udp", "127.0.0.1:0")
++		if err != nil {
++			t.Fatal(err)
++		}
++		server := &D.Server{PacketConn: conn, Handler: D.HandlerFunc(func(w D.ResponseWriter, query *D.Msg) {
++			reply := new(D.Msg)
++			reply.SetReply(query)
++			reply.Answer = []D.RR{&D.A{Hdr: D.RR_Header{Name: query.Question[0].Name,
++				Rrtype: D.TypeA, Class: D.ClassINET, Ttl: 60}, A: net.ParseIP(answer)}}
++			_ = w.WriteMsg(reply)
++		})}
++		ready := make(chan struct{})
++		server.NotifyStartedFunc = func() { close(ready) }
++		go func() { _ = server.ActivateAndServe() }()
++		<-ready
++		t.Cleanup(func() { _ = server.Shutdown() })
++		UpdateSystemDNS([]string{conn.LocalAddr().String()})
++		for _, r := range []*Resolver{main.Resolver, main.DirectResolver, policy.Resolver} {
++			r.ClearCache()
++			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
++			reply, err := r.ExchangeContext(ctx, new(D.Msg).SetQuestion("system-dns.test.", D.TypeA))
++			cancel()
++			if err != nil || reply == nil || len(reply.Answer) != 1 || reply.Answer[0].(*D.A).A.String() != answer {
++				t.Fatalf("system resolver query = %v, %v; want %s", reply, err, answer)
++			}
++		}
++	}
++	UpdateSystemDNS(nil)
++	clients, err := newSystemClient().getDnsClients()
++	if err != nil || len(clients) != 0 || systemResolver.Load() == nil {
++		t.Fatalf("empty snapshot fell back to native discovery: %v, %v", clients, err)
++	}
++}
++
++func TestManagedSystemDNSConcurrentUpdate(t *testing.T) {
++	t.Cleanup(func() { systemResolver.Store(nil) })
++	UpdateSystemDNS(nil)
++	var workers sync.WaitGroup
++	for i := 0; i < 4; i++ {
++		workers.Add(1)
++		go func() {
++			defer workers.Done()
++			client := newSystemClient()
++			for j := 0; j < 100; j++ {
++				_, _ = client.getDnsClients()
++				_ = client.Address()
++				client.ResetConnection()
++			}
++		}()
++	}
++	for i := 0; i < 100; i++ {
++		UpdateSystemDNS([]string{"192.0.2.1:53", "[fe80::1%wlan0]:53"})
++		UpdateSystemDNS(nil)
++	}
++	workers.Wait()
++}
+diff --git a/hub/executor/system_dns.go b/hub/executor/system_dns.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..3f0e8881993b1bb71ec3de23b039e3e70558dadf
+--- /dev/null
++++ b/hub/executor/system_dns.go
+@@ -0,0 +1,24 @@
++package executor
++
++import (
++	"sync/atomic"
++
++	"github.com/metacubex/mihomo/dns"
++)
++
++var systemDNSFlushPending atomic.Bool
++
++// UpdateSystemDNS publishes immediately; provider downloads may hold mux for seconds.
++func UpdateSystemDNS(servers []string) {
++	dns.UpdateSystemDNS(servers)
++	if !systemDNSFlushPending.CompareAndSwap(false, true) {
++		return
++	}
++	go func() {
++		mux.Lock()
++		defer mux.Unlock()
++		// Allow one subsequent refresh for updates arriving during this flush.
++		systemDNSFlushPending.Store(false)
++		dns.FlushCacheWithDefaultResolver()
++	}()
++}
+diff --git a/hub/executor/system_dns_test.go b/hub/executor/system_dns_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..532d2aab92971a6febcdde56d5952fcdad236d3c
+--- /dev/null
++++ b/hub/executor/system_dns_test.go
+@@ -0,0 +1,92 @@
++//go:build !(android && cmfa)
++
++package executor
++
++import (
++	"sync"
++	"testing"
++	"time"
++
++	"github.com/metacubex/mihomo/component/resolver"
++	"github.com/metacubex/mihomo/dns"
++)
++
++type systemDNSRefreshProbe struct {
++	resolver.Resolver
++	cleared chan struct{}
++	reset   chan struct{}
++}
++
++func (p *systemDNSRefreshProbe) ClearCache()      { p.cleared <- struct{}{} }
++func (p *systemDNSRefreshProbe) ResetConnection() { p.reset <- struct{}{} }
++
++func (p *systemDNSRefreshProbe) wait(t *testing.T) {
++	t.Helper()
++	for _, done := range []chan struct{}{p.cleared, p.reset} {
++		select {
++		case <-done:
++		case <-time.After(5 * time.Second):
++			t.Fatal("DNS cache/connection refresh was lost")
++		}
++	}
++}
++
++func TestSystemDNSDoesNotWaitForConfig(t *testing.T) {
++	probe := &systemDNSRefreshProbe{cleared: make(chan struct{}, 1), reset: make(chan struct{}, 1)}
++	previous := resolver.DefaultResolver
++	t.Cleanup(func() {
++		mux.Lock()
++		resolver.DefaultResolver = previous
++		mux.Unlock()
++	})
++	mux.Lock()
++	resolver.DefaultResolver = probe
++	updated := make(chan struct{})
++	go func() {
++		for i := 0; i < 1000; i++ {
++			UpdateSystemDNS([]string{"192.0.2.1:53"})
++		}
++		UpdateSystemDNS(nil) // A helper failure must withdraw DNS without waiting for mux.
++		close(updated)
++	}()
++	select {
++	case <-updated:
++		mux.Unlock()
++	case <-time.After(5 * time.Second):
++		mux.Unlock()
++		<-updated
++		t.Fatal("DNS updates/failure withdrawal waited for configuration to finish")
++	}
++	probe.wait(t)
++	UpdateSystemDNS(nil)
++	probe.wait(t) // Coalescing must still allow the next network change to flush.
++}
++
++func TestSystemDNSDuringResolverReplacement(t *testing.T) {
++	previous := resolver.DefaultResolver
++	t.Cleanup(func() {
++		mux.Lock()
++		resolver.DefaultResolver = previous
++		mux.Unlock()
++	})
++	var updates sync.WaitGroup
++	updates.Add(1)
++	go func() {
++		defer updates.Done()
++		for i := 0; i < 100; i++ {
++			UpdateSystemDNS(nil)
++		}
++	}()
++	for i := 0; i < 100; i++ {
++		mux.Lock()
++		resolver.DefaultResolver = dns.NewResolver(dns.Config{})
++		mux.Unlock()
++	}
++	updates.Wait()
++	probe := &systemDNSRefreshProbe{cleared: make(chan struct{}, 1), reset: make(chan struct{}, 1)}
++	mux.Lock()
++	resolver.DefaultResolver = probe
++	UpdateSystemDNS(nil)
++	mux.Unlock()
++	probe.wait(t)
++}
+diff --git a/main.go b/main.go
+index 972caf8bc0f4b4f74ee9077e8dfd0123aa14368c..af7d74dff1160ab53a37a3017d837b2dca753875 100644
+--- a/main.go
++++ b/main.go
+@@ -14,11 +14,13 @@ import (
+ 	"strconv"
+ 	"strings"
+ 	"syscall"
++	"time"
+ 
+ 	"github.com/metacubex/mihomo/common/cmd"
+ 	"github.com/metacubex/mihomo/component/age"
+ 	"github.com/metacubex/mihomo/component/generator"
+ 	"github.com/metacubex/mihomo/component/geodata"
++	"github.com/metacubex/mihomo/component/systemdns"
+ 	"github.com/metacubex/mihomo/component/updater"
+ 	"github.com/metacubex/mihomo/config"
+ 	C "github.com/metacubex/mihomo/constant"
+@@ -131,6 +133,26 @@ func main() {
+ 		C.SetHomeDir(homeDir)
+ 	}
+ 
++	systemDNSFailure := make(chan error, 1)
++	systemDNSFailed := false
++	defer func() {
++		if systemDNSFailed {
++			os.Exit(70)
++		}
++	}()
++	if !testConfig {
++		stop, err := systemdns.Start(C.Path.HomeDir(), executor.UpdateSystemDNS, func(err error) {
++			// Start the deadline even while startup or SIGHUP is loading providers.
++			time.AfterFunc(10*time.Second, func() { os.Exit(70) })
++			systemDNSFailure <- err
++		})
++		if err != nil {
++			log.Errorln("Start system DNS: %s", err)
++			os.Exit(70)
++		}
++		defer stop()
++	}
++
+ 	if geodataMode {
+ 		geodata.SetGeodataMode(true)
+ 	}
+@@ -242,6 +264,10 @@ func main() {
+ 	signal.Notify(hupSign, syscall.SIGHUP)
+ 	for {
+ 		select {
++		case err := <-systemDNSFailure:
++			log.Errorln("%s", err)
++			systemDNSFailed = true
++			return
+ 		case <-termSign:
+ 			return
+ 		case <-hupSign:
+-- 
+2.55.0
+

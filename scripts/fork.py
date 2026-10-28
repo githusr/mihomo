@@ -83,6 +83,17 @@ def build_workflow(upstream, spec):
     checkout_steps[0].setdefault("with", {}).update({"persist-credentials": False})
     if "ref" in checkout_steps[0]["with"]:
         raise ValueError("Upstream checkout pins a ref instead of the generated commit")
+    if any(row["goos"] == "android" for row in rows):
+        build_steps = [s for s in job["steps"] if s.get("name") == "Build core"]
+        if len(build_steps) != 1:
+            raise ValueError("Upstream Build core step changed; update the Android helper adapter")
+        job["steps"].insert(job["steps"].index(build_steps[0]), {
+            "name": "Build Android system DNS helper",
+            "if": "${{ matrix.jobs.goos == 'android' }}",
+            "run": 'sdkmanager "platforms;android-36" "build-tools;36.0.0"\n'
+                   'python3 component/systemdns/test_observer.py\n'
+                   'python3 component/systemdns/build.py\n',
+        })
     for step in job["steps"]:
         if step.get("uses", "").startswith("actions/upload-artifact@"):
             step["with"]["if-no-files-found"] = "error"

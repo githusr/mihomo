@@ -93,7 +93,7 @@ class ForkTests(unittest.TestCase):
         self.assertEqual(steps[core - 1], {
             "name": "Build Android system DNS helper",
             "if": "${{ matrix.jobs.goos == 'android' }}",
-            "run": 'sdkmanager "platforms;android-36" "build-tools;36.0.0"\n'
+            "run": '"$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-36" "build-tools;36.0.0"\n'
                    'python3 component/systemdns/test_observer.py\n'
                    'python3 component/systemdns/build.py\n',
         })

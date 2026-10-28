@@ -13,6 +13,9 @@ import (
 )
 
 func (c *systemClient) getDnsClients() ([]dnsClient, error) {
+	if clients := systemResolver.Load(); clients != nil {
+		return *clients, nil
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	var err error
@@ -70,4 +73,10 @@ func (c *systemClient) getDnsClients() ([]dnsClient, error) {
 	return nil, err
 }
 
-func (c *systemClient) ResetConnection() {}
+func (c *systemClient) ResetConnection() {
+	if clients := systemResolver.Load(); clients != nil {
+		for _, client := range *clients {
+			client.ResetConnection()
+		}
+	}
+}

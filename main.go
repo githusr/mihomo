@@ -14,11 +14,13 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/metacubex/mihomo/common/cmd"
 	"github.com/metacubex/mihomo/component/age"
 	"github.com/metacubex/mihomo/component/generator"
 	"github.com/metacubex/mihomo/component/geodata"
+	"github.com/metacubex/mihomo/component/systemdns"
 	"github.com/metacubex/mihomo/component/updater"
 	"github.com/metacubex/mihomo/config"
 	C "github.com/metacubex/mihomo/constant"
@@ -129,6 +131,26 @@ func main() {
 			homeDir = filepath.Join(currentDir, homeDir)
 		}
 		C.SetHomeDir(homeDir)
+	}
+
+	systemDNSFailure := make(chan error, 1)
+	systemDNSFailed := false
+	defer func() {
+		if systemDNSFailed {
+			os.Exit(70)
+		}
+	}()
+	if !testConfig {
+		stop, err := systemdns.Start(C.Path.HomeDir(), executor.UpdateSystemDNS, func(err error) {
+			// Start the deadline even while startup or SIGHUP is loading providers.
+			time.AfterFunc(10*time.Second, func() { os.Exit(70) })
+			systemDNSFailure <- err
+		})
+		if err != nil {
+			log.Errorln("Start system DNS: %s", err)
+			os.Exit(70)
+		}
+		defer stop()
 	}
 
 	if geodataMode {
@@ -242,6 +264,10 @@ func main() {
 	signal.Notify(hupSign, syscall.SIGHUP)
 	for {
 		select {
+		case err := <-systemDNSFailure:
+			log.Errorln("%s", err)
+			systemDNSFailed = true
+			return
 		case <-termSign:
 			return
 		case <-hupSign:

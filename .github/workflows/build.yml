@@ -1,0 +1,13 @@
+name: Fork build
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  instructions:
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          echo 'Run Sync upstream on automation. It generates and dispatches this workflow on _build/* branches.'
+          exit 1
+

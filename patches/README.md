@@ -1,6 +1,7 @@
 按文件名顺序应用本目录中的 `*.patch`，Meta、Alpha 和保留的正式版本共用一份补丁。
 
 使用 `git format-patch --full-index --binary` 导出补丁，命名为 `0001-description.patch` 等。
+提交说明中的外部 Issue/PR 来源使用普通文字（如 `AndroidLibClashLite pull request 2`），链接放在 README 中，避免同步反复生成反向引用。
 补丁必须包含对应的测试。不要直接修改自动生成的 `Meta`、`Alpha`、`_build/*` 分支。
 
 默认已经适配核心升级地址、版本号和构建发布流程，不需要把这些改动再做成 patch。

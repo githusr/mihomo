@@ -1,9 +1,9 @@
-From 2455d1f0440aeeb3f1fb742c68db0ee6a0a7d246 Mon Sep 17 00:00:00 2001
+From 5b36763e7c815d55b221340b562fcec57891d3b1 Mon Sep 17 00:00:00 2001
 From: githusr <143207276+githusr@users.noreply.github.com>
 Date: Wed, 28 Oct 2026 06:12:14 +0000
 Subject: [PATCH] feat: follow Android network DNS in the standalone root core
 
-Adapt the ConnectivityManager observer, bounded socketpair protocol and retained dex cache from Asterisk4Magisk/AndroidLibClashLite#2. Publish system DNS snapshots without waiting for configuration reloads, coalesce cache refreshes under the existing lock, and start the failure deadline independently of the main loop. Keep the upstream changes limited to main and system DNS hooks; the fork workflow adapter builds the embedded dex. Include IPC, cache, resolver and reload regressions.
+Adapt the ConnectivityManager observer, bounded socketpair protocol and retained dex cache from Asterisk4Magisk/AndroidLibClashLite pull request 2. Publish system DNS snapshots without waiting for configuration reloads, coalesce cache refreshes under the existing lock, and start the failure deadline independently of the main loop. Keep the upstream changes limited to main and system DNS hooks; the fork workflow adapter builds the embedded dex. Include IPC, cache, resolver and reload regressions.
 ---
  component/systemdns/.gitignore                |   2 +
  component/systemdns/README.md                 |  66 +++++

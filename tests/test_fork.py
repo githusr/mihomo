@@ -150,6 +150,13 @@ class ForkTests(unittest.TestCase):
             fork.prune("example/mihomo", {"v1.1.0", "Prerelease-Alpha"})
         command.assert_called_once_with("gh", "release", "delete", "v1.0.0", "--repo", "example/mihomo", "--cleanup-tag", "--yes")
 
+    def test_prune_keeps_previous_version_until_replacement_is_published(self):
+        items = [dict(tag_name="v1.0.0", body=fork.MARKER, draft=False),
+                 dict(tag_name="v1.1.0", body=fork.MARKER, draft=True)]
+        with patch.object(fork, "releases", return_value=items), patch.object(fork, "run") as command:
+            fork.prune("example/mihomo", {"v1.1.0"})
+        command.assert_not_called()
+
     def test_publish_uploads_version_last_and_prunes_only_after_publication(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

@@ -250,7 +250,12 @@ def start_build(repo, spec, commit):
 
 
 def prune(repo, keep):
-    for release in releases(repo):
+    items = releases(repo)
+    available = {r["tag_name"] for r in items if not r.get("draft", False) and MARKER in (r["body"] or "")}
+    if not keep <= available:
+        print("Keeping older releases until all replacement versions are available", flush=True)
+        return
+    for release in items:
         if release["tag_name"] not in keep and MARKER in (release["body"] or ""):
             if not TAG.fullmatch(release["tag_name"]):
                 raise ValueError("Refusing to prune an unexpected managed tag")
@@ -317,10 +322,10 @@ def sync(dry_run=False):
         if pending:
             print(f"Waiting for {len(pending)} build(s)", flush=True)
             time.sleep(45)
-    if pending or errors:
-        raise RuntimeError(f"Some updates failed or timed out; keeping existing releases: {errors}")
-    if not dry_run:
+    if not dry_run and not pending:
         prune(repo, {s["tag"] for s in specs if s["tag"] != "Meta"})
+    if pending or errors:
+        raise RuntimeError(f"Some updates failed or timed out; their previous builds are retained: {errors}")
 
 
 def manifest():
